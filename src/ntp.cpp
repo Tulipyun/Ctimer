@@ -91,7 +91,9 @@ NtpResult parseNtp(std::span<const unsigned char> packet, std::uint64_t originat
 }
 
 NtpResult queryNtp(const Source& source, std::size_t index, const ClockModel& baseline,
-                   const std::function<bool()>& cancelled) {
+                   const std::function<bool()>& cancelled, const std::wstring& preferredAddress,
+                   const std::wstring& avoidedAddress,
+                   const std::function<bool(const std::wstring&)>& acquireEndpoint) {
     NtpResult r;
     using CancelLookup = INT(WSAAPI*)(LPHANDLE);
     using LookupResult = INT(WSAAPI*)(LPOVERLAPPED);
@@ -141,12 +143,33 @@ NtpResult queryNtp(const Source& source, std::size_t index, const ClockModel& ba
         r.status = cancelled() ? L"已停止" : L"DNS 失败: " + std::to_wstring(status);
         return r;
     }
-    auto selected = addresses;
-    for (auto p = addresses; p; p = p->ai_next)
-        if (p->ai_family == AF_INET) {
-            selected = p;
-            break;
-        }
+    auto numericAddress = [](PADDRINFOEXW p) {
+        wchar_t text[128]{};
+        GetNameInfoW(p->ai_addr, static_cast<socklen_t>(p->ai_addrlen), text, 128, nullptr, 0,
+                     NI_NUMERICHOST);
+        return std::wstring(text);
+    };
+    std::vector<PADDRINFOEXW> choices;
+    for (auto p = addresses; p; p = p->ai_next) {
+        if (p->ai_family == AF_INET || p->ai_family == AF_INET6)
+            choices.push_back(p);
+    }
+    // Stable order lets consecutive failures visit all addresses, rather than
+    // indefinitely alternating the first two entries of a shuffled DNS reply.
+    std::sort(choices.begin(), choices.end(), [&](auto a, auto b) {
+        if (a->ai_family != b->ai_family)
+            return a->ai_family == AF_INET;
+        return numericAddress(a) < numericAddress(b);
+    });
+    auto preferred = std::find_if(choices.begin(), choices.end(),
+                                  [&](auto p) { return numericAddress(p) == preferredAddress; });
+    auto avoided = std::find_if(choices.begin(), choices.end(),
+                                [&](auto p) { return numericAddress(p) == avoidedAddress; });
+    auto selected = choices.empty() ? addresses : choices.front();
+    if (preferred != choices.end())
+        selected = *preferred;
+    else if (avoided != choices.end())
+        selected = choices[(static_cast<std::size_t>(avoided - choices.begin()) + 1) % choices.size()];
     wchar_t numeric[128]{};
     GetNameInfoW(selected->ai_addr, static_cast<socklen_t>(selected->ai_addrlen), numeric, 128, nullptr, 0,
                  NI_NUMERICHOST);
@@ -171,21 +194,31 @@ NtpResult queryNtp(const Source& source, std::size_t index, const ClockModel& ba
     request[2] = 6;
     request[3] = static_cast<unsigned char>(-20);
     const auto frequency = qpcFrequency();
-    Tick sentQpc = qpc();
-    Ns sentUtc = baseline.utc(sentQpc, frequency);
-    auto stamp = encodeNtp(sentUtc);
-    write64(request.data() + 40, stamp);
     if (cancelled()) {
         closesocket(socket);
         r.status = L"已停止";
         return r;
     }
+    if (acquireEndpoint && !acquireEndpoint(r.address)) {
+        closesocket(socket);
+        r.deferred = true;
+        r.status = L"共享端点/限速：本轮不重复请求";
+        return r;
+    }
+    // All potentially locking checks happen before taking the transmission timestamp.
+    Tick sentQpc = qpc();
+    Ns sentUtc = baseline.utc(sentQpc, frequency);
+    auto stamp = encodeNtp(sentUtc);
+    write64(request.data() + 40, stamp);
+    r.sentQpc = sentQpc;
+    r.t1 = sentUtc;
     if (send(socket, reinterpret_cast<const char*>(request.data()), static_cast<int>(request.size()), 0) !=
         48) {
         closesocket(socket);
         r.status = L"UDP 发送失败";
         return r;
     }
+    r.sent = true;
     const Tick expires = sentQpc + 2 * frequency;
     r.status = L"UDP/123 超时";
     while (!cancelled() && qpc() < expires) {
@@ -208,9 +241,14 @@ NtpResult queryNtp(const Source& source, std::size_t index, const ClockModel& ba
             r.status = L"UDP 接收失败: " + std::to_wstring(WSAGetLastError());
             break;
         }
+        // A four-timestamp phase estimate belongs to the exchange midpoint.
+        const Tick sampleQpc = sentQpc + (receivedQpc - sentQpc) / 2;
         auto parsed = parseNtp(std::span(response.data(), count), stamp, sentUtc,
-                               baseline.utc(receivedQpc, frequency), receivedQpc, index, source);
+                               baseline.utc(receivedQpc, frequency), sampleQpc, index, source);
         parsed.address = r.address;
+        parsed.sent = true;
+        parsed.sentQpc = sentQpc;
+        parsed.receivedQpc = receivedQpc;
         if (!parsed.ok && parsed.status == L"响应不匹配/重复响应")
             continue;
         r = parsed;

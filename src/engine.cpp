@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "version.h"
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -15,6 +16,8 @@ Engine::Engine(Config config, std::filesystem::path logs,
     : baseline(initialClock()), frequency(qpcFrequency()), config_(std::move(config)),
       logDirectory_(std::move(logs)), clockSetter_(std::move(clockSetter)) {
     state_.clock = baseline;
+    sessionId_ = std::to_string(GetCurrentProcessId()) + "-" + std::to_string(baseline.anchorQpc);
+    state_.requestedFaults = config_.faultBudget;
     state_.clock.residualPpm = config_.driftAllowancePpm;
     state_.syncing = config_.autoSync;
     manualPaused_ = !config_.autoSync;
@@ -81,11 +84,20 @@ void Engine::setSystemClockSync(bool enabled) {
     config_.autoSystemClock = enabled;
     state_.systemClockStatus = enabled ? L"等待自动校时" : L"系统校时未启用";
 }
+void Engine::setRefinement(bool enabled) {
+    std::scoped_lock lock(mutex_);
+    config_.preRefine = enabled;
+    maybeFreezeLocked(qpc());
+}
 void Engine::resumeAfterJobLocked() {
     state_.frozen = false;
     state_.syncing = !manualPaused_;
     ++syncEpoch_;
     state_.syncNote = manualPaused_ ? L"保持手动暂停" : L"操作结束，已恢复自动同步";
+    state_.refinementStarted = 0;
+    state_.refinementSamples = 0;
+    state_.refinementProgress = 0;
+    state_.phase = state_.syncing ? SyncPhase::Tracking : SyncPhase::Paused;
     SetEvent(wake_);
 }
 bool Engine::configure(const Config& config, std::wstring& error) {
@@ -97,8 +109,14 @@ bool Engine::configure(const Config& config, std::wstring& error) {
     ++syncEpoch_;
     config_ = config;
     state_.sources.clear();
-    phaseHistory_.clear();
-    lastSelection_.clear();
+    paths_.clear();
+    state_.requestedFaults = config.faultBudget;
+    state_.frequencyGroups = state_.toleratedFaults = 0;
+    state_.frequencyMature = state_.faultToleranceReady = false;
+    state_.refinementStarted = 0;
+    state_.refinementSamples = 0;
+    state_.refinementProgress = 0;
+    state_.safeInterval = {};
     for (auto& s : config.sources) {
         SourceView v;
         v.source = s;
@@ -106,11 +124,13 @@ bool Engine::configure(const Config& config, std::wstring& error) {
     }
     // Preserve rate-limit ledger across source edits and manual restart.
     state_.clock.calibrated = false;
+    state_.clock.frequencyPpm = 0;
     state_.clock.residualPpm = config.driftAllowancePpm;
     state_.lastSuccessfulSyncQpc = 0;
     state_.lastSyncFailed = false;
     state_.primarySource.clear();
-    state_.groups = state_.availableGroups = 0;
+    state_.groups = state_.availableGroups = state_.consensusGroups = 0;
+    maybeFreezeLocked(qpc());
     state_.syncNote = L"来源已更新，需要重新获得有效样本";
     SetEvent(wake_);
     return true;
@@ -119,6 +139,9 @@ void Engine::freezeLocked(Tick) {
     if (state_.frozen)
         return;
     state_.frozen = true;
+    state_.phase = SyncPhase::Frozen;
+    if (state_.refinementStarted)
+        state_.refinementProgress = 1;
     state_.syncing = false;
     ++syncEpoch_;
     state_.frozenDeadline = state_.clock.deadline(job_.target, frequency);
@@ -129,6 +152,39 @@ void Engine::freezeLocked(Tick) {
 void Engine::maybeFreezeLocked(Tick now) {
     if (state_.active && !state_.frozen && freezeDue(state_.clock.utc(now, frequency), job_.target))
         freezeLocked(now);
+    const auto next = syncPhase(state_.syncing, state_.frozen, state_.active, config_.preRefine,
+                                state_.clock.utc(now, frequency), job_.target, config_.refinementLeadSeconds);
+    if (next == SyncPhase::Refining) {
+        if (!state_.refinementStarted) {
+            state_.refinementStarted = now;
+            state_.refinementSamples = 0;
+        }
+        const double remaining =
+            (job_.target - state_.clock.utc(now, frequency)) / static_cast<double>(Second);
+        state_.refinementProgress = std::clamp(
+            (config_.refinementLeadSeconds - remaining) / (config_.refinementLeadSeconds - 60.0), 0.0, 1.0);
+    } else if (next != SyncPhase::Frozen) {
+        state_.refinementStarted = 0;
+        state_.refinementProgress = 0;
+        state_.refinementSamples = 0;
+    }
+    state_.phase = next == SyncPhase::Tracking && !state_.clock.calibrated ? SyncPhase::Discovering : next;
+}
+bool Engine::acquireEndpoint(const std::wstring& address, const Source& source, std::uint64_t epoch) {
+    std::scoped_lock lock(mutex_);
+    const auto now = qpc();
+    maybeFreezeLocked(now);
+    if (quitting_ || !state_.syncing || state_.frozen || epoch != syncEpoch_)
+        return false;
+    auto key = address + L":" + std::to_wstring(source.port);
+    std::erase_if(nextEndpointQuery_, [now](const auto& entry) { return entry.second <= now; });
+    if (nextEndpointQuery_[key] > now)
+        return false;
+    const int interval = state_.phase == SyncPhase::Refining
+                             ? std::max(source.minPollSeconds, config_.refinementPollSeconds)
+                             : source.minPollSeconds;
+    nextEndpointQuery_[key] = now + static_cast<Tick>(interval) * frequency;
+    return true;
 }
 bool Engine::cancelledQuery(std::uint64_t epoch) {
     if (quitting_)
@@ -203,6 +259,21 @@ void Engine::sessionInterrupted() {
     std::scoped_lock lock(mutex_);
     state_.clock.calibrated = false;
     ++syncEpoch_;
+    paths_.clear();
+    state_.clock.frequencyPpm = 0;
+    state_.clock.residualPpm = config_.driftAllowancePpm;
+    state_.frequencyMature = state_.faultToleranceReady = false;
+    state_.frequencyGroups = state_.groups = state_.availableGroups = state_.consensusGroups = 0;
+    state_.toleratedFaults = 0;
+    state_.safeInterval = {};
+    state_.primarySource.clear();
+    state_.lastSuccessfulSyncQpc = 0;
+    for (auto& view : state_.sources) {
+        view.last.reset();
+        view.fit = {};
+        view.selected = false;
+        view.filteredSamples = 0;
+    }
     state_.syncing = !manualPaused_;
     state_.syncNote = L"会话/电源状态变化：取消任务并重新校准";
 }
@@ -210,81 +281,114 @@ void Engine::sessionInterrupted() {
 void Engine::updateEstimateLocked(Tick now, Tick freshSince) {
     if (!state_.syncing || state_.frozen)
         return;
+    std::map<std::wstring, std::size_t> representatives;
+    for (std::size_t i = 0; i < state_.sources.size(); ++i) {
+        auto& view = state_.sources[i];
+        view.selected = false;
+        view.filteredSamples = 0;
+        if (!view.source.enabled || view.disabled || view.address.empty())
+            continue;
+        auto key = view.address + L":" + std::to_wstring(view.source.port);
+        auto path = paths_.find(key);
+        if (path == paths_.end() || !path->second.latest())
+            continue;
+        if (now - path->second.latest()->qpc > 180 * frequency)
+            continue;
+        auto found = representatives.find(key);
+        if (found == representatives.end() || path->second.latest()->source == i)
+            representatives[key] = i;
+    }
+    std::map<std::wstring, FrequencyFit> fits;
+    for (const auto& [endpoint, index] : representatives) {
+        auto& view = state_.sources[index];
+        auto fit = paths_.at(endpoint).frequencyFit(frequency);
+        view.fit = fit;
+        if (!fit.valid)
+            continue;
+        auto group = operatorGroup(view.source);
+        auto old = fits.find(group);
+        if (old == fits.end() || fit.errorPpm < old->second.errorPpm)
+            fits[group] = fit;
+    }
+    double ppm = state_.clock.frequencyPpm;
+    double budget = std::max(config_.driftAllowancePpm, state_.clock.residualPpm);
+    bool frequencyMature = false;
+    if (!fits.empty()) {
+        std::vector<Interval> intervals;
+        std::vector<double> estimates;
+        int mature = 0;
+        for (const auto& [_, fit] : fits) {
+            intervals.push_back({fit.ppm - fit.errorPpm, fit.ppm + fit.errorPpm});
+            estimates.push_back(fit.ppm);
+            if (fit.mature)
+                ++mature;
+        }
+        auto result = selectIntervals(intervals, config_.faultBudget);
+        if (result.valid) {
+            ppm = std::clamp(median(estimates), result.envelope.lower, result.envelope.upper);
+            const double fitBudget =
+                std::max({2.0, ppm - result.envelope.lower, result.envelope.upper - ppm});
+            frequencyMature = (config_.faultBudget == 0 || result.faultToleranceReady) &&
+                              mature >= std::max(2, 2 * config_.faultBudget + 1);
+            budget = frequencyMature ? fitBudget : std::max(config_.driftAllowancePpm, fitBudget);
+        }
+    }
     std::vector<Sample> candidates;
-    std::set<std::wstring> seenAddresses;
-    // Prefer low-delay valid sources, but always retain distinct configured groups.
-    std::vector<size_t> order;
-    for (size_t i = 0; i < state_.sources.size(); ++i) {
-        state_.sources[i].selected = false;
-        if (state_.sources[i].last)
-            order.push_back(i);
+    for (const auto& [endpoint, index] : representatives) {
+        auto& view = state_.sources[index];
+        const bool refining = state_.phase == SyncPhase::Refining;
+        auto filtered = paths_.at(endpoint).filtered(now, frequency, ppm, budget, refining ? 120 : 180,
+                                                     refining ? state_.refinementStarted : 0);
+        if (!filtered.valid) {
+            view.status = filtered.reason;
+            continue;
+        }
+        filtered.sample.source = index;
+        filtered.sample.group = operatorGroup(view.source);
+        filtered.sample.failurePenaltyMs = std::min(100.0, view.failures * 5.0);
+        view.filteredSamples = static_cast<unsigned>(filtered.samples);
+        view.basisAgeSeconds = filtered.basisAgeSeconds;
+        view.qualityMs = sampleQuality(filtered.sample);
+        candidates.push_back(filtered.sample);
     }
-    std::sort(order.begin(), order.end(),
-              [&](auto a, auto b) { return state_.sources[a].last->rttMs < state_.sources[b].last->rttMs; });
-    for (auto i : order) {
-        auto& v = state_.sources[i];
-        if (!v.source.enabled || v.disabled || !v.last)
-            continue;
-        auto s = *v.last;
-        s.group = operatorGroup(v.source);
-        std::vector<double> deviations;
-        for (const auto& previous : v.history)
-            deviations.push_back(previous.offsetMs);
-        const double center = median(deviations);
-        for (auto& offset : deviations)
-            offset = std::abs(offset - center);
-        s.jitterMs = median(deviations) * 1.4826;
-        s.failurePenaltyMs = std::min(100.0, v.failures * 5.0);
-        const auto age = static_cast<double>(now - s.qpc) / frequency;
-        if (age > std::max(180.0, std::min(600.0, v.source.minPollSeconds * 2.5)))
-            continue;
-        if (!v.address.empty() && !seenAddresses.insert(v.address).second)
-            continue;
-        s.offsetMs += age * state_.clock.frequencyPpm / 1000.0;
-        s.rootDistanceMs += age * config_.driftAllowancePpm / 1000.0;
-        v.qualityMs = s.rttMs / 2 + s.rootDistanceMs + 2 * s.jitterMs + s.failurePenaltyMs;
-        candidates.push_back(s);
-    }
-    auto estimate = combineSources(candidates);
-    state_.availableGroups = estimate.availableGroups;
+    auto estimate = combineSources(candidates, config_.faultBudget);
     if (!estimate.valid) {
         state_.lastSyncFailed = true;
-        state_.syncNote = L"时间源分歧：未应用本轮估计，保持旧模型";
+        state_.syncNote = estimate.ambiguous ? L"存在多个可行时间区间，保留旧模型"
+                                             : L"来源区间冲突或没有有效样本，保留旧模型";
         return;
     }
     bool freshSelected = false;
-    for (auto i : estimate.usedSources)
-        if (state_.sources[i].last && state_.sources[i].last->qpc >= freshSince)
+    for (const auto& sample : candidates)
+        if (sample.qpc >= freshSince && std::find(estimate.usedSources.begin(), estimate.usedSources.end(),
+                                                  sample.source) != estimate.usedSources.end())
             freshSelected = true;
     if (!freshSelected) {
         state_.lastSyncFailed = true;
-        state_.syncNote = L"主用来源未收到新样本，保持上次时间";
+        state_.syncNote = L"本轮未更新主用路径，保持原成功时间";
         return;
     }
     const Ns estimatedUtc =
         baseline.utc(now, frequency) + static_cast<Ns>(std::llround(estimate.offsetMs * Millisecond));
-    if (state_.active && freezeDue(estimatedUtc, job_.target)) {
-        freezeLocked(now);
+    ClockModel candidate{
+        now, estimatedUtc, ppm, estimate.uncertaintyMs, budget, true, state_.clock.version + 1};
+    const Tick commit = qpc();
+    maybeFreezeLocked(commit);
+    if (state_.frozen || !state_.syncing)
+        return;
+    if (state_.active && freezeDue(candidate.utc(commit, frequency), job_.target)) {
+        freezeLocked(commit);
         return;
     }
-    double ppm = state_.clock.frequencyPpm;
-    if (estimate.usedSources != lastSelection_) {
-        phaseHistory_.clear();
-        lastSelection_ = estimate.usedSources;
-    }
-    phaseHistory_.push_back({static_cast<double>(now - baseline.anchorQpc) / frequency, estimate.offsetMs});
-    if (phaseHistory_.size() > 32)
-        phaseHistory_.erase(phaseHistory_.begin());
-    if (auto fit = fitFrequency(phaseHistory_))
-        ppm = *fit;
-    state_.clock = {now,
-                    estimatedUtc,
-                    ppm,
-                    estimate.uncertaintyMs,
-                    config_.driftAllowancePpm,
-                    true,
-                    state_.clock.version + 1};
-    state_.lastSuccessfulSyncQpc = now;
+    state_.clock = candidate;
+    state_.frequencyMature = frequencyMature;
+    state_.frequencyGroups = static_cast<int>(fits.size());
+    state_.availableGroups = estimate.availableGroups;
+    state_.requestedFaults = config_.faultBudget;
+    state_.toleratedFaults = estimate.toleratedFaults;
+    state_.faultToleranceReady = estimate.faultToleranceReady;
+    state_.safeInterval = estimate.safeInterval;
+    state_.lastSuccessfulSyncQpc = commit;
     state_.lastSyncFailed = false;
     state_.groups = estimate.groups;
     state_.consensusGroups = estimate.consensusGroups;
@@ -292,13 +396,18 @@ void Engine::updateEstimateLocked(Tick now, Tick freshSince) {
     for (auto i : estimate.usedSources)
         state_.sources[i].selected = true;
     state_.syncNote = L"主用 " + state_.primarySource + L"；" + std::to_wstring(estimate.consensusGroups) +
-                      L" 组来源一致，优选 " + std::to_wstring(estimate.groups) + L" 组";
-    if (config_.autoSystemClock && (!state_.active || job_.target - estimatedUtc > 61 * Second)) {
+                      L"/" + std::to_wstring(estimate.availableGroups) + L" 组一致；";
+    state_.syncNote += config_.faultBudget == 0 ? L"全组交集（F0）"
+                       : estimate.faultToleranceReady
+                           ? L"F" + std::to_wstring(estimate.toleratedFaults) + L" 区间假设"
+                           : L"来源不足，降级参考";
+    if (config_.autoSystemClock &&
+        (!state_.active || job_.target - state_.clock.utc(commit, frequency) > 61 * Second)) {
         if (std::abs(static_cast<double>(systemUtc() - state_.clock.utc(qpc(), frequency))) < 2 * Millisecond)
             state_.systemClockStatus = L"本机已对齐";
-        else if (now - lastSystemWrite_ >= 10 * frequency) {
+        else if (commit - lastSystemWrite_ >= 10 * frequency) {
             auto result = clockSetter_(state_.clock);
-            lastSystemWrite_ = now;
+            lastSystemWrite_ = commit;
             state_.systemClockStatus = result.success ? L"本机自动校时成功"
                                        : result.needsPrivilege
                                            ? L"本机校时需管理员权限"
@@ -306,31 +415,39 @@ void Engine::updateEstimateLocked(Tick now, Tick freshSince) {
         }
     }
 }
-
 void Engine::networkLoop() {
     while (!quitting_) {
-        std::vector<std::pair<size_t, Source>> due;
+        struct Request {
+            std::size_t index;
+            Source source;
+            std::wstring preferred, avoided;
+        };
+        std::vector<Request> due;
         std::uint64_t epoch = 0;
-        Tick roundStart{};
-        bool acceptedNew = false;
+        Tick roundStart = 0;
+        bool storedNew = false, attempted = false;
         {
             std::scoped_lock lock(mutex_);
-            const auto now = qpc();
+            const Tick now = qpc();
             maybeFreezeLocked(now);
             if (state_.syncing) {
-                for (size_t i = 0; i < state_.sources.size() && due.size() < 6; ++i) {
-                    auto& v = state_.sources[i];
-                    auto key = sourceKey(v.source);
-                    if (!v.source.enabled || v.disabled || nextQuery_[key] > now)
+                for (std::size_t i = 0; i < state_.sources.size() && due.size() < 6; ++i) {
+                    auto& view = state_.sources[i];
+                    auto key = sourceKey(view.source);
+                    if (!view.source.enabled || view.disabled || nextQuery_[key] > now)
                         continue;
-                    nextQuery_[key] = now + static_cast<Tick>(v.source.minPollSeconds) * frequency;
-                    v.status = L"采样中…";
-                    due.emplace_back(i, v.source);
+                    int interval = state_.phase == SyncPhase::Refining
+                                       ? std::max(view.source.minPollSeconds, config_.refinementPollSeconds)
+                                       : view.source.minPollSeconds;
+                    nextQuery_[key] = now + static_cast<Tick>(interval) * frequency;
+                    view.status = state_.phase == SyncPhase::Refining ? L"精校准采样中" : L"采样中";
+                    due.push_back({i, view.source, view.consecutiveFailures < 2 ? view.address : L"",
+                                   view.consecutiveFailures >= 2 ? view.address : L""});
                     ++state_.attempts;
                 }
                 epoch = syncEpoch_;
-                state_.busy = !due.empty();
                 roundStart = now;
+                state_.busy = !due.empty();
             }
         }
         if (due.empty()) {
@@ -338,86 +455,105 @@ void Engine::networkLoop() {
             continue;
         }
         std::vector<std::future<NtpResult>> futures;
-        for (const auto& [i, s] : due)
-            futures.push_back(std::async(std::launch::async, [this, i, s, epoch] {
-                return queryNtp(s, i, baseline, [this, epoch] { return cancelledQuery(epoch); });
+        for (const auto& request : due)
+            futures.push_back(std::async(std::launch::async, [this, request, epoch] {
+                return queryNtp(
+                    request.source, request.index, baseline, [this, epoch] { return cancelledQuery(epoch); },
+                    request.preferred, request.avoided,
+                    [this, request, epoch](const std::wstring& address) {
+                        return acquireEndpoint(address, request.source, epoch);
+                    });
             }));
-        std::vector<std::pair<Source, NtpResult>> log;
-        for (size_t n = 0; n < futures.size(); ++n) {
-            auto result = futures[n].get();
-            const auto index = due[n].first;
+        std::vector<std::pair<Source, NtpResult>> results;
+        for (std::size_t i = 0; i < futures.size(); ++i) {
+            NtpResult result;
+            try {
+                result = futures[i].get();
+            } catch (...) {
+                result.status = L"采样工作线程异常";
+            }
+            const auto& request = due[i];
             {
                 std::scoped_lock lock(mutex_);
-                auto now = qpc();
+                const Tick now = qpc();
                 maybeFreezeLocked(now);
-                if (result.backoffSeconds)
-                    nextQuery_[sourceKey(due[n].second)] = std::max(nextQuery_[sourceKey(due[n].second)],
-                                                                    now + result.backoffSeconds * frequency);
+                if (result.backoffSeconds) {
+                    auto until = now + static_cast<Tick>(result.backoffSeconds) * frequency;
+                    nextQuery_[sourceKey(request.source)] =
+                        std::max(nextQuery_[sourceKey(request.source)], until);
+                    if (!result.address.empty()) {
+                        auto key = result.address + L":" + std::to_wstring(request.source.port);
+                        nextEndpointQuery_[key] = std::max(nextEndpointQuery_[key], until);
+                    }
+                }
                 if (epoch != syncEpoch_ || !state_.syncing) {
                     if (result.ok)
                         ++state_.discardedAfterStop;
                     result.ok = false;
                     result.status = L"停止/冻结后不应用响应";
-                    if (index < state_.sources.size() &&
-                        sourceKey(state_.sources[index].source) == sourceKey(due[n].second))
-                        state_.sources[index].status = L"已停止；未应用本轮响应";
-                } else if (index < state_.sources.size()) {
-                    auto& v = state_.sources[index];
-                    v.status = result.status;
-                    v.disabled = result.disable;
-                    if (result.ok) {
-                        if (!v.address.empty() && v.address != result.address) {
-                            v.history.clear();
-                            v.last.reset();
-                        }
-                        v.address = result.address;
+                    if (request.index < state_.sources.size() &&
+                        sourceKey(state_.sources[request.index].source) == sourceKey(request.source))
+                        state_.sources[request.index].status = result.status;
+                } else if (request.index < state_.sources.size()) {
+                    auto& view = state_.sources[request.index];
+                    view.status = result.status;
+                    view.disabled = result.disable;
+                    if (!result.address.empty())
+                        view.address = result.address;
+                    attempted = attempted || !result.deferred;
+                    if (!result.ok && !result.deferred) {
+                        ++view.failures;
+                        ++view.consecutiveFailures;
                     }
-                    if (!result.ok)
-                        ++v.failures;
                     if (result.ok) {
-                        if (v.failures)
-                            --v.failures;
-                        const auto currentMin = v.history.empty()
-                                                    ? result.sample.rttMs
-                                                    : std::min_element(v.history.begin(), v.history.end(),
-                                                                       [](const auto& a, const auto& b) {
-                                                                           return a.rttMs < b.rttMs;
-                                                                       })
-                                                          ->rttMs;
-                        // Avoid persisting an old path's filter forever; age it at each source update.
-                        while (!v.history.empty() && now - v.history.front().qpc > 600 * frequency)
-                            v.history.pop_front();
-                        if (v.history.size() >= 3 && result.sample.rttMs > currentMin * 3 + 5)
-                            v.status = L"高延迟样本已剔除";
-                        else {
-                            v.last = result.sample;
-                            ++v.received;
-                            ++state_.validSamples;
-                            acceptedNew = true;
+                        view.consecutiveFailures = 0;
+                        if (view.failures)
+                            --view.failures;
+                        auto endpoint = result.address + L":" + std::to_wstring(request.source.port);
+                        if (!paths_.contains(endpoint) && paths_.size() >= 128) {
+                            auto oldest = std::min_element(
+                                paths_.begin(), paths_.end(), [](const auto& a, const auto& b) {
+                                    const auto left = a.second.latest(), right = b.second.latest();
+                                    return (left ? left->qpc : 0) < (right ? right->qpc : 0);
+                                });
+                            if (oldest != paths_.end())
+                                paths_.erase(oldest);
                         }
-                        v.history.push_back(result.sample);
-                        if (v.history.size() > 8)
-                            v.history.pop_front();
+                        result.sample.group = operatorGroup(request.source);
+                        result.stored = paths_[endpoint].observe(result.sample, frequency);
+                        if (result.stored) {
+                            view.last = result.sample;
+                            ++view.received;
+                            ++state_.validSamples;
+                            storedNew = true;
+                            if (state_.phase == SyncPhase::Refining)
+                                ++state_.refinementSamples;
+                        }
                     }
                 }
             }
-            log.emplace_back(due[n].second, std::move(result));
+            results.emplace_back(request.source, std::move(result));
         }
+        Snapshot model;
         {
             std::scoped_lock lock(mutex_);
             maybeFreezeLocked(qpc());
-            state_.lastAttemptQpc = qpc();
+            if (attempted)
+                state_.lastAttemptQpc = qpc();
             if (epoch == syncEpoch_ && state_.syncing) {
-                if (acceptedNew)
+                if (storedNew)
                     updateEstimateLocked(qpc(), roundStart);
-                else {
+                else if (attempted) {
                     state_.lastSyncFailed = true;
-                    state_.syncNote = L"本轮对时失败，保持上次校准时间";
+                    state_.syncNote = L"本轮对时失败，保持原成功时间";
                 }
             }
             state_.busy = false;
+            model = state_;
         }
-        logSamples(log);
+        logSamples(results);
+        if (attempted)
+            logModel(model);
     }
 }
 
@@ -536,20 +672,77 @@ void Engine::schedulerLoop() {
     if (timer)
         CloseHandle(timer);
 }
+namespace {
+std::string csv(const std::wstring& text) {
+    std::string value = utf8(text), escaped = "\"";
+    for (char c : value) {
+        if (c == '\"')
+            escaped += '\"';
+        escaped += c;
+    }
+    return escaped + "\"";
+}
+const char* phaseName(SyncPhase phase) {
+    switch (phase) {
+    case SyncPhase::Discovering:
+        return "discovering";
+    case SyncPhase::Tracking:
+        return "tracking";
+    case SyncPhase::Refining:
+        return "refining";
+    case SyncPhase::Frozen:
+        return "frozen";
+    case SyncPhase::Paused:
+        return "paused";
+    }
+    return "unknown";
+}
+} // namespace
 void Engine::logSamples(const std::vector<std::pair<Source, NtpResult>>& results) {
     try {
         std::filesystem::create_directories(logDirectory_);
-        auto path = logDirectory_ / L"ntp-samples.csv";
+        auto path = logDirectory_ / L"ntp-samples-v2.csv";
         bool header = !std::filesystem::exists(path);
         std::ofstream out(path, std::ios::app);
-        out << std::setprecision(12);
+        out << std::setprecision(15);
         if (header)
-            out << "source,ip,accepted_protocol,t1_ns,t2_ns,t3_ns,t4_ns,offset_ms,rtt_ms,root_distance_ms,"
+            out << "session,version,sample,qpc_frequency,baseline_qpc,baseline_utc_ns,source,group,ip,port,"
+                   "sent,protocol_valid,stored,deferred,q1,q4,t1_ns,t2_ns,t3_ns,t4_ns,rtt_ms,offset_ms,root_"
+                   "ms,status\n";
+        for (const auto& [source, result] : results) {
+            out << sessionId_ << ',' << CTIMER_VERSION_STRING << ',' << ++sampleSequence_ << ',' << frequency
+                << ',' << baseline.anchorQpc << ',' << baseline.anchorUtc << ',' << csv(source.host) << ','
+                << csv(operatorGroup(source)) << ',' << csv(result.address) << ',' << source.port << ','
+                << result.sent << ',' << result.ok << ',' << result.stored << ',' << result.deferred << ','
+                << result.sentQpc << ',' << result.receivedQpc << ',' << result.t1 << ',' << result.t2 << ','
+                << result.t3 << ',' << result.t4 << ',' << result.sample.rttMs << ','
+                << result.sample.offsetMs << ',' << result.sample.rootDistanceMs << ',' << csv(result.status)
+                << '\n';
+        }
+    } catch (...) {
+    }
+}
+void Engine::logModel(const Snapshot& snapshot) {
+    try {
+        std::filesystem::create_directories(logDirectory_);
+        auto path = logDirectory_ / L"clock-models-v1.csv";
+        bool header = !std::filesystem::exists(path);
+        std::ofstream out(path, std::ios::app);
+        out << std::setprecision(15);
+        if (header)
+            out << "session,version,observed_qpc,phase,model_version,anchor_qpc,anchor_utc_ns,rate_ppm,rate_"
+                   "margin_ppm,frequency_mature,lower_ms,upper_ms,error_ms,groups,consensus_groups,requested_"
+                   "faults,tolerated_faults,fault_ready,last_success_qpc,failed,refinement_samples,primary,"
                    "status\n";
-        for (const auto& [s, r] : results)
-            out << utf8(s.host) << ',' << utf8(r.address) << ',' << r.ok << ',' << r.t1 << ',' << r.t2 << ','
-                << r.t3 << ',' << r.t4 << ',' << r.sample.offsetMs << ',' << r.sample.rttMs << ','
-                << r.sample.rootDistanceMs << ',' << utf8(r.status) << '\n';
+        const auto& m = snapshot.clock;
+        out << sessionId_ << ',' << CTIMER_VERSION_STRING << ',' << qpc() << ',' << phaseName(snapshot.phase)
+            << ',' << m.version << ',' << m.anchorQpc << ',' << m.anchorUtc << ',' << m.frequencyPpm << ','
+            << m.residualPpm << ',' << snapshot.frequencyMature << ',' << snapshot.safeInterval.lower << ','
+            << snapshot.safeInterval.upper << ',' << m.errorMs << ',' << snapshot.groups << ','
+            << snapshot.consensusGroups << ',' << snapshot.requestedFaults << ',' << snapshot.toleratedFaults
+            << ',' << snapshot.faultToleranceReady << ',' << snapshot.lastSuccessfulSyncQpc << ','
+            << snapshot.lastSyncFailed << ',' << snapshot.refinementSamples << ','
+            << csv(snapshot.primarySource) << ',' << csv(snapshot.syncNote) << '\n';
     } catch (...) {
     }
 }

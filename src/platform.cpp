@@ -294,6 +294,14 @@ bool loadConfig(const std::filesystem::path& path, Config& config, std::wstring&
                 next.lateToleranceMs = n;
             else if (key == L"DriftAllowancePpm")
                 next.driftAllowancePpm = n;
+            else if (key == L"FaultBudget")
+                next.faultBudget = n;
+            else if (key == L"PreRefine")
+                next.preRefine = n != 0;
+            else if (key == L"RefinementLeadSeconds")
+                next.refinementLeadSeconds = n;
+            else if (key == L"RefinementPollSeconds")
+                next.refinementPollSeconds = n;
             else if (key == L"WindowSaved")
                 next.window.valid = n != 0;
             else if (key == L"WindowX")
@@ -317,6 +325,10 @@ bool loadConfig(const std::filesystem::path& path, Config& config, std::wstring&
             next.repetitions < 1 || next.repetitions > 1000 || next.utcOffsetMinutes < -720 ||
             next.utcOffsetMinutes > 840 || next.lateToleranceMs < 1 || next.lateToleranceMs > 1000 ||
             next.driftAllowancePpm < 1 || next.driftAllowancePpm > 1000)
+            throw 1;
+        if (next.faultBudget < 0 || next.faultBudget > 3 || next.refinementLeadSeconds < 70 ||
+            next.refinementLeadSeconds > 900 || next.refinementPollSeconds < 4 ||
+            next.refinementPollSeconds > 60)
             throw 1;
         if (next.scheduleMinute < 0 || next.scheduleMinute > 59 || next.scheduleSecond < 0 ||
             next.scheduleSecond > 59 || next.scheduleMillisecond < 0 || next.scheduleMillisecond > 999 ||
@@ -353,13 +365,15 @@ bool saveConfig(const std::filesystem::path& path, const Config& c, std::wstring
             << "\nUtcOffsetMinutes=" << c.utcOffsetMinutes << "\nLateToleranceMs=" << c.lateToleranceMs
             << "\nDriftAllowancePpm=" << static_cast<int>(c.driftAllowancePpm)
             << "\nAutoElevate=" << c.autoElevate << "\nHasSchedule=" << c.hasSchedule
-            << "\nMinute=" << c.scheduleMinute << "\nSecond=" << c.scheduleSecond
-            << "\nMillisecond=" << c.scheduleMillisecond << "\nActionKind=" << c.actionKind
-            << "\nKey=" << utf8(c.key) << "\nWindowSaved=" << c.window.valid << "\nWindowX=" << c.window.x
-            << "\nWindowY=" << c.window.y << "\nWindowWidth=" << c.window.width
-            << "\nWindowHeight=" << c.window.height << "\nWindowDpi=" << c.window.dpi
-            << "\nWindowCompact=" << c.window.compact << "\nWindowExpanded=" << c.window.expanded
-            << "\nWindowMaximized=" << c.window.maximized
+            << "\nFaultBudget=" << c.faultBudget << "\nPreRefine=" << c.preRefine
+            << "\nRefinementLeadSeconds=" << c.refinementLeadSeconds
+            << "\nRefinementPollSeconds=" << c.refinementPollSeconds << "\nMinute=" << c.scheduleMinute
+            << "\nSecond=" << c.scheduleSecond << "\nMillisecond=" << c.scheduleMillisecond
+            << "\nActionKind=" << c.actionKind << "\nKey=" << utf8(c.key)
+            << "\nWindowSaved=" << c.window.valid << "\nWindowX=" << c.window.x << "\nWindowY=" << c.window.y
+            << "\nWindowWidth=" << c.window.width << "\nWindowHeight=" << c.window.height
+            << "\nWindowDpi=" << c.window.dpi << "\nWindowCompact=" << c.window.compact
+            << "\nWindowExpanded=" << c.window.expanded << "\nWindowMaximized=" << c.window.maximized
             << "\n\n[Sources]\n# host[:port] | operator_group | minimum_poll_seconds; prefix ! to disable\n"
             << utf8(serializeSources(c.sources));
         out.flush();

@@ -77,14 +77,24 @@ static std::wstring trim(std::wstring s) {
     return s.substr(a, s.find_last_not_of(L" \r\n\t") - a + 1);
 }
 std::vector<Source> defaultSources() {
-    auto result = regionalSources();
-    result.insert(
-        result.end(),
-        {{L"time.cloudflare.com", L"cloudflare"}, {L"ntp.nict.jp", L"nict"}, {L"time.nist.gov", L"nist"}});
+    auto result = diverseSources();
+    auto additional = regionalSources();
+    result.insert(result.end(), additional.begin(), additional.end());
     return result;
 }
 std::vector<Source> regionalSources() {
     return {{L"ntp.aliyun.com", L"aliyun"}, {L"ntp1.aliyun.com", L"aliyun"}, {L"ntp2.aliyun.com", L"aliyun"}};
+}
+std::vector<Source> diverseSources() {
+    return {{L"ntp.ntsc.ac.cn", L"ntsc"},
+            {L"ntp.cnnic.cn", L"cnnic"},
+            {L"cn.pool.ntp.org", L"pool", 123, 64},
+            {L"time.cloudflare.com", L"cloudflare"},
+            {L"ntp.nict.jp", L"nict"},
+            {L"time.nist.gov", L"nist"},
+            {L"ntp.ubuntu.com", L"canonical", 123, 64},
+            {L"a.ntp.br", L"nicbr", 123, 64},
+            {L"ntp.netnod.se", L"netnod", 123, 64}};
 }
 std::wstring operatorGroup(const Source& s) {
     // Known operator aliases must not become independent votes through user-entered group names.
@@ -101,6 +111,20 @@ std::wstring operatorGroup(const Source& s) {
         return L"nist";
     if (h.ends_with(L".tsinghua.edu.cn"))
         return L"tsinghua";
+    if (h.ends_with(L".ntsc.ac.cn"))
+        return L"ntsc";
+    if (h.ends_with(L".cnnic.cn"))
+        return L"cnnic";
+    if (h.ends_with(L".pool.ntp.org") || h == L"pool.ntp.org")
+        return L"pool";
+    if (h == L"ntp.ubuntu.com")
+        return L"canonical";
+    if (h.ends_with(L".ntp.br"))
+        return L"nicbr";
+    if (h == L"ntp.se" || h.ends_with(L".netnod.se"))
+        return L"netnod";
+    if (h.ends_with(L".ptb.de"))
+        return L"ptb";
     return s.group.empty() ? h : s.group;
 }
 bool addRegionalSources(std::vector<Source>& sources) {
@@ -119,6 +143,19 @@ bool addRegionalSources(std::vector<Source>& sources) {
         auto group = operatorGroup(s);
         if (group != s.group) {
             s.group = group;
+            changed = true;
+        }
+    }
+    return changed;
+}
+bool addDiverseSources(std::vector<Source>& sources) {
+    bool changed = false;
+    for (const auto& source : diverseSources()) {
+        if (sources.size() >= 24)
+            break;
+        if (std::none_of(sources.begin(), sources.end(),
+                         [&](const Source& s) { return s.host == source.host && s.port == source.port; })) {
+            sources.push_back(source);
             changed = true;
         }
     }
@@ -211,7 +248,7 @@ std::optional<std::vector<Source>> parseSources(const std::wstring& text, std::w
             s.group = trim(line.substr(bar + 1, next == std::wstring::npos ? next : next - bar - 1));
             if (next != std::wstring::npos && (!integer(trim(line.substr(next + 1)), s.minPollSeconds) ||
                                                s.minPollSeconds < 4 || s.minPollSeconds > 86400))
-                return fail(L"轮询间隔需为 4–86400 秒；公共源建议至少 64 秒。");
+                return fail(L"轮询间隔需为 4–86400 秒；请遵守该时间源的请求频率限制。");
         }
         s.group = operatorGroup(s);
         if (s.group.size() > 64)
@@ -235,94 +272,136 @@ double median(std::vector<double> v) {
     size_t n = v.size();
     return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
 }
-Estimate combineSources(const std::vector<Sample>& samples) {
-    // Only one independent vote per configured operator. Pick its lowest-delay observation.
+SyncPhase syncPhase(bool syncing, bool frozen, bool active, bool refiningEnabled, Ns now, Ns target,
+                    int refinementLeadSeconds) {
+    if (frozen)
+        return SyncPhase::Frozen;
+    if (!syncing)
+        return SyncPhase::Paused;
+    if (active && refiningEnabled && target - now > FreezeLead &&
+        target - now <= static_cast<Ns>(refinementLeadSeconds) * Second)
+        return SyncPhase::Refining;
+    return SyncPhase::Tracking;
+}
+
+Interval sampleInterval(const Sample& sample) {
+    if (sample.interval)
+        return *sample.interval;
+    const double radius = std::max(0.05, sample.rootDistanceMs + sample.rttMs / 2);
+    return {sample.offsetMs - radius, sample.offsetMs + radius};
+}
+double sampleQuality(const Sample& sample) {
+    auto bounds = sampleInterval(sample);
+    return std::max(0.05, std::max(sample.offsetMs - bounds.lower, bounds.upper - sample.offsetMs) +
+                              2 * sample.jitterMs + sample.failurePenaltyMs);
+}
+IntervalConsensus selectIntervals(const std::vector<Interval>& intervals, int requestedFaults) {
+    IntervalConsensus result;
+    result.requestedFaults = std::max(0, requestedFaults);
+    const int n = static_cast<int>(intervals.size());
+    if (!n)
+        return result;
+    result.faultToleranceReady = result.requestedFaults > 0 && n >= 2 * result.requestedFaults + 1;
+    result.toleratedFaults = result.faultToleranceReady ? result.requestedFaults : 0;
+    result.quorum = n - result.toleratedFaults;
+    struct Event {
+        int starts{}, ends{};
+    };
+    std::map<double, Event> events;
+    for (const auto& interval : intervals) {
+        if (!std::isfinite(interval.lower) || !std::isfinite(interval.upper) ||
+            interval.lower > interval.upper)
+            return result;
+        ++events[interval.lower].starts;
+        ++events[interval.upper].ends;
+    }
+    auto append = [&](double low, double high) {
+        if (!result.regions.empty() && low <= result.regions.back().upper)
+            result.regions.back().upper = std::max(result.regions.back().upper, high);
+        else
+            result.regions.push_back({low, high});
+    };
+    int active = 0;
+    for (auto it = events.begin(); it != events.end(); ++it) {
+        const double coordinate = it->first;
+        // Closed intervals: starts join before endpoint coverage is checked; ends leave afterwards.
+        const int at = active + it->second.starts;
+        if (at >= result.quorum)
+            append(coordinate, coordinate);
+        active = at - it->second.ends;
+        auto next = std::next(it);
+        if (next != events.end() && active >= result.quorum)
+            append(coordinate, next->first);
+    }
+    if (result.regions.empty())
+        return result;
+    result.envelope = {result.regions.front().lower, result.regions.back().upper};
+    result.ambiguous = result.regions.size() > 1;
+    result.valid = !result.ambiguous;
+    return result;
+}
+Estimate combineSources(const std::vector<Sample>& samples, int requestedFaults) {
     std::map<std::wstring, Sample> byGroup;
     for (const auto& s : samples) {
+        const auto bounds = sampleInterval(s);
         if (!std::isfinite(s.offsetMs) || !std::isfinite(s.rttMs) || !std::isfinite(s.rootDistanceMs) ||
-            s.rttMs < 0 || s.rootDistanceMs < 0)
+            !std::isfinite(s.jitterMs) || !std::isfinite(s.failurePenaltyMs) ||
+            !std::isfinite(bounds.lower) || !std::isfinite(bounds.upper) || bounds.lower > bounds.upper ||
+            s.rttMs < 0 || s.rootDistanceMs < 0 || s.jitterMs < 0 || s.failurePenaltyMs < 0)
             continue;
-        auto it = byGroup.find(s.group);
-        auto score = [](const Sample& p) {
-            return p.rttMs / 2 + p.rootDistanceMs + 2 * p.jitterMs + p.failurePenaltyMs;
-        };
-        if (it == byGroup.end() || score(s) < score(it->second))
+        auto found = byGroup.find(s.group);
+        if (found == byGroup.end() || sampleQuality(s) < sampleQuality(found->second))
             byGroup[s.group] = s;
     }
     Estimate e;
     e.availableGroups = static_cast<int>(byGroup.size());
-    std::vector<Sample> groups;
-    for (const auto& [_, s] : byGroup)
-        groups.push_back(s);
-    if (groups.empty())
-        return e;
-    auto radius = [](const Sample& s) { return std::max(0.05, s.rootDistanceMs + s.rttMs / 2.0); };
-    std::vector<double> ends;
-    for (const auto& s : groups) {
-        ends.push_back(s.offsetMs - radius(s));
-        ends.push_back(s.offsetMs + radius(s));
+    std::vector<Sample> candidates;
+    std::vector<Interval> intervals;
+    for (const auto& [_, s] : byGroup) {
+        candidates.push_back(s);
+        intervals.push_back(sampleInterval(s));
     }
-    std::sort(ends.begin(), ends.end());
-    const int quorum = static_cast<int>(groups.size() / 2 + 1);
-    double consensusLow = 0, consensusHigh = 0;
-    bool found = false, gap = false;
-    for (size_t i = 0; i + 1 < ends.size(); ++i) {
-        const double center = (ends[i] + ends[i + 1]) / 2;
-        int count = 0;
-        for (const auto& s : groups)
-            if (std::abs(s.offsetMs - center) <= radius(s) + 1e-9)
-                ++count;
-        if (count >= quorum) {
-            if (gap)
-                return e; // Ambiguous disjoint majorities must not silently select a cluster.
-            if (!found)
-                consensusLow = ends[i];
-            found = true;
-            consensusHigh = ends[i + 1];
-        } else if (found)
-            gap = true;
-    }
-    if (!found)
+    const auto consensus = selectIntervals(intervals, requestedFaults);
+    e.ambiguous = consensus.ambiguous;
+    e.safeInterval = consensus.envelope;
+    e.toleratedFaults = consensus.toleratedFaults;
+    e.quorum = consensus.quorum;
+    e.faultToleranceReady = consensus.faultToleranceReady;
+    if (!consensus.valid)
         return e;
-    const double center = (consensusLow + consensusHigh) / 2;
+    const double center = (e.safeInterval.lower + e.safeInterval.upper) / 2;
     std::vector<Sample> selected;
-    std::vector<double> offsets;
-    for (const auto& s : groups)
-        if (std::abs(s.offsetMs - center) <= radius(s) + 1e-9) {
+    for (const auto& s : candidates) {
+        auto bounds = sampleInterval(s);
+        if (bounds.lower <= center && center <= bounds.upper)
             selected.push_back(s);
-            offsets.push_back(s.offsetMs);
-        }
-    if (static_cast<int>(selected.size()) < quorum)
-        return e;
+    }
     e.consensusGroups = static_cast<int>(selected.size());
-    // First reject inconsistent clocks, then choose precise, stable survivors. Slow backups
-    // participate in consistency checking without dominating the operational clock estimate.
-    auto score = [](const Sample& s) {
-        return std::max(0.05, s.rttMs / 2 + s.rootDistanceMs + 2 * s.jitterMs + s.failurePenaltyMs);
-    };
+    if (e.consensusGroups < e.quorum)
+        return e;
     std::sort(selected.begin(), selected.end(),
-              [&](const auto& a, const auto& b) { return score(a) < score(b); });
-    const double limit = std::max(5.0, score(selected.front()) * 2.5);
-    selected.erase(
-        std::remove_if(selected.begin(), selected.end(), [&](const auto& s) { return score(s) > limit; }),
-        selected.end());
+              [](const auto& a, const auto& b) { return sampleQuality(a) < sampleQuality(b); });
+    const double limit = std::max(5.0, sampleQuality(selected.front()) * 2.5);
+    selected.erase(std::remove_if(selected.begin(), selected.end(),
+                                  [&](const auto& s) { return sampleQuality(s) > limit; }),
+                   selected.end());
     if (selected.size() > 3)
         selected.resize(3);
     e.referenceSource = selected.front().source;
-    double sum = 0, weightSum = 0;
+    double total = 0, weighted = 0;
     for (const auto& s : selected) {
-        const double weight = 1.0 / (score(s) * score(s));
-        sum += weight * s.offsetMs;
-        weightSum += weight;
-    }
-    e.offsetMs = std::clamp(sum / weightSum, consensusLow, consensusHigh);
-    std::vector<double> deviations;
-    for (const auto& s : selected) {
+        const double weight = 1 / (sampleQuality(s) * sampleQuality(s));
+        weighted += s.offsetMs * weight;
+        total += weight;
         e.usedSources.push_back(s.source);
-        deviations.push_back(std::abs(s.offsetMs - e.offsetMs));
-        e.uncertaintyMs = std::max(e.uncertaintyMs, std::abs(s.offsetMs - e.offsetMs) + radius(s));
     }
-    e.jitterMs = median(deviations) * 1.4826;
+    e.offsetMs = std::clamp(weighted / total, e.safeInterval.lower, e.safeInterval.upper);
+    // Quality pruning affects the point estimate only. Never shrink the fault-model envelope.
+    e.uncertaintyMs = std::max({0.05, e.offsetMs - e.safeInterval.lower, e.safeInterval.upper - e.offsetMs});
+    std::vector<double> deviations;
+    for (const auto& s : selected)
+        deviations.push_back(std::abs(s.offsetMs - e.offsetMs));
+    e.jitterMs = 1.4826 * median(deviations);
     e.groups = static_cast<int>(selected.size());
     e.valid = true;
     return e;

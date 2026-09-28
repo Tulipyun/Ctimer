@@ -48,6 +48,7 @@ enum Id {
     StatusBar,
     AutoSystemClock,
     Elevate,
+    PreRefine,
     SourceText = 200,
     SourceSave,
     SourceCancel
@@ -207,7 +208,7 @@ void layout() {
                                              Details,
                                              301})
         ShowWindow(control(id), mini ? SW_HIDE : SW_SHOWNA);
-    for (int id : {SourcesList, AutoStart, Sound, OpenConfig, ReloadConfig, EditSources, Elevate})
+    for (int id : {SourcesList, AutoStart, Sound, OpenConfig, ReloadConfig, EditSources, Elevate, PreRefine})
         ShowWindow(control(id), !mini && details ? SW_SHOWNA : SW_HIDE);
     for (int id :
          std::initializer_list<int>{303, 310, 311, 312, Preview, Result, SyncNote, 302, FillFuture, Probe})
@@ -261,6 +262,7 @@ void layout() {
         place(Elevate, 482, 426, 146, 32);
         place(OpenConfig, 16, 473, 139, 32);
         place(ReloadConfig, 166, 473, 148, 32);
+        place(PreRefine, 350, 477, 240, 26);
         place(SourcesList, 16, 520, w - 32, 157);
     }
     SendMessageW(control(StatusBar), WM_SIZE, 0, 0);
@@ -489,6 +491,9 @@ void refresh() {
     if (cached.active) {
         setText(TaskStatus, cached.frozen
                                 ? L"准备中  " + number(std::max(0.0, (cached.target - now) / 1e9), 3) + L" 秒"
+                            : cached.phase == SyncPhase::Refining
+                                ? L"精校准  " + number(cached.refinementProgress * 100, 0) + L"% · " +
+                                      minuteTime(cached.target)
                                 : L"下一次  " + minuteTime(cached.target));
         setText(ActionStatus, cached.actionSummary);
     } else if (draft.pending) {
@@ -551,6 +556,10 @@ void refresh() {
         primary = L"■ 冻结";
     else if (!cached.syncing)
         primary = L"Ⅱ 暂停";
+    else if (cached.phase == SyncPhase::Refining)
+        primary = cached.lastSyncFailed ? L"! 精校准未更新"
+                  : mini                ? L"精校准 " + number(cached.refinementProgress * 100, 0) + L"%"
+                                        : L"精校准 · " + std::to_wstring(cached.refinementSamples) + L" 样本";
     else if (cached.busy)
         primary = L"↻ 同步中";
     else if (cached.lastSyncFailed)
@@ -570,6 +579,15 @@ void refresh() {
     SendMessageW(control(StatusBar), SB_SETTEXTW, 2, reinterpret_cast<LPARAM>(next.c_str()));
     auto syncTip = cached.syncNote + L"\r\n主用：" + cached.primarySource + L"\r\n成功校准后 " +
                    number(since, 1) + L" 秒";
+    syncTip += L"\r\n频率：" + number(cached.clock.frequencyPpm, 3) + L" ppm；裕量 " +
+               number(cached.clock.residualPpm, 2) + L" ppm" +
+               (cached.frequencyMature ? L"（稳定样本）" : L"（仍在学习）");
+    syncTip += L"\r\n请求容错 F" + std::to_wstring(cached.requestedFaults) + L"，当前 " +
+               (cached.requestedFaults == 0  ? L"全组交集，无故障容忍"
+                : cached.faultToleranceReady ? L"满足来源数量条件"
+                                             : L"来源不足，降级参考");
+    if (cached.phase == SyncPhase::Refining)
+        syncTip += L"\r\n进度表示精校准窗口经过时间，不代表精度达标比例";
     SendMessageW(control(StatusBar), SB_SETTIPTEXTW, 0, reinterpret_cast<LPARAM>(syncTip.c_str()));
     SendMessageW(control(StatusBar), SB_SETTIPTEXTW, 2, reinterpret_cast<LPARAM>(formNote.c_str()));
 }
@@ -743,6 +761,8 @@ void createControls() {
     SendMessageW(control(AutoSchedule), BM_SETCHECK, config.autoSchedule ? BST_CHECKED : BST_UNCHECKED, 0);
     add(mainWindow, L"BUTTON", L"准备时鸣音", BS_AUTOCHECKBOX | WS_TABSTOP, Sound);
     SendMessageW(control(Sound), BM_SETCHECK, config.sound ? BST_CHECKED : BST_UNCHECKED, 0);
+    add(mainWindow, L"BUTTON", L"冻结前精校准", BS_AUTOCHECKBOX | WS_TABSTOP, PreRefine);
+    SendMessageW(control(PreRefine), BM_SETCHECK, config.preRefine ? BST_CHECKED : BST_UNCHECKED, 0);
     add(mainWindow, L"BUTTON", L"自动校准系统时间", BS_AUTOCHECKBOX | WS_TABSTOP, AutoSystemClock);
     SendMessageW(control(AutoSystemClock), BM_SETCHECK, config.autoSystemClock ? BST_CHECKED : BST_UNCHECKED,
                  0);
@@ -1078,8 +1098,10 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 config = next;
                 draft.cancel();
                 programmaticEdit = true;
-                setTimeInput(L"00:00.000");
-                timeTouched = false;
+                setTimeInput(savedTime());
+                timeTouched = config.hasSchedule;
+                SendMessageW(control(ActionCombo), CB_SETCURSEL, config.actionKind, 0);
+                setText(KeyEdit, config.key);
                 setText(HoldEdit, std::to_wstring(config.holdMs));
                 setText(CountEdit, std::to_wstring(config.repetitions));
                 setText(IntervalEdit, std::to_wstring(config.intervalMs));
@@ -1087,10 +1109,13 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 for (auto [check, value] :
                      {std::pair{AutoStart, config.autoSync}, std::pair{AutoSchedule, config.autoSchedule},
                       std::pair{Sound, config.sound}, std::pair{Topmost, config.topmost},
-                      std::pair{AutoSystemClock, config.autoSystemClock}})
+                      std::pair{AutoSystemClock, config.autoSystemClock},
+                      std::pair{PreRefine, config.preRefine}})
                     SendMessageW(control(check), BM_SETCHECK, value ? BST_CHECKED : BST_UNCHECKED, 0);
                 applyTopmost();
                 lastSourcesFingerprint.clear();
+                if (config.hasSchedule && config.autoSchedule)
+                    changedForm();
             }
             break;
         }
@@ -1125,6 +1150,12 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         case AutoSystemClock:
             config.autoSystemClock = SendMessageW(control(AutoSystemClock), BM_GETCHECK, 0, 0) == BST_CHECKED;
             engine->setSystemClockSync(config.autoSystemClock);
+            if (!saveConfig(configPath, config, error))
+                alert(error);
+            break;
+        case PreRefine:
+            config.preRefine = SendMessageW(control(PreRefine), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            engine->setRefinement(config.preRefine);
             if (!saveConfig(configPath, config, error))
                 alert(error);
             break;
@@ -1280,21 +1311,24 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int show) {
         MessageBoxW(nullptr, (L"无法创建配置：" + error).c_str(), app::ChineseName, MB_OK | MB_ICONERROR);
         return 2;
     }
-    if (!smoke && config.sourceCatalogVersion < 3) {
+    if (!smoke && config.sourceCatalogVersion < 4) {
         std::error_code backupError;
         std::filesystem::copy_file(configPath,
-                                   std::filesystem::path(configPath.wstring() + L".before-v0.3.bak"),
+                                   std::filesystem::path(configPath.wstring() + L".before-v0.6.bak"),
                                    std::filesystem::copy_options::skip_existing, backupError);
-        addRegionalSources(config.sources);
-        for (auto& source : config.sources) {
-            auto group = operatorGroup(source);
-            if (group == L"aliyun" || group == L"tencent" || group == L"cloudflare" || group == L"nict" ||
-                group == L"nist")
-                source.minPollSeconds = 10;
+        if (config.sourceCatalogVersion < 3) {
+            addRegionalSources(config.sources);
+            for (auto& source : config.sources) {
+                auto group = operatorGroup(source);
+                if (group == L"aliyun" || group == L"tencent" || group == L"cloudflare" || group == L"nict" ||
+                    group == L"nist")
+                    source.minPollSeconds = 10;
+            }
+            config.autoSync = true;
+            config.autoSystemClock = true;
         }
-        config.sourceCatalogVersion = 3;
-        config.autoSync = true;
-        config.autoSystemClock = true;
+        addDiverseSources(config.sources);
+        config.sourceCatalogVersion = 4;
         if (!saveConfig(configPath, config, error)) {
             MessageBoxW(nullptr, error.c_str(), L"定时点击器 · 配置保存失败", MB_OK);
             return 2;

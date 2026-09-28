@@ -7,9 +7,11 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+#include <set>
 
 using namespace ct;
 static int failures{}, checks{};
+void runEstimatorTests();
 void check(bool condition, const char* label) {
     ++checks;
     if (!condition) {
@@ -116,18 +118,52 @@ void benchmark() {
 int main(int argc, char** argv) {
     WSADATA data;
     WSAStartup(MAKEWORD(2, 2), &data);
+    if (argc == 3 && std::string(argv[1]) == "--observe") {
+        const int seconds = std::atoi(argv[2]);
+        if (seconds < 10 || seconds > 3600)
+            return 2;
+        const auto directory = std::filesystem::path("build") / ("ntp-observation-" + std::to_string(qpc()));
+        std::cout << "Read-only NTP observation: " << directory.string() << std::endl;
+        {
+            Config config;
+            config.autoSystemClock = config.autoElevate = config.autoSchedule = false;
+            Engine engine(config, directory);
+            const auto start = qpc();
+            for (int elapsed = 0; elapsed < seconds; ++elapsed) {
+                Sleep(1000);
+                if ((elapsed + 1) % 10 == 0) {
+                    auto snapshot = engine.snapshot();
+                    std::cout << "t=" << (qpc() - start) / engine.frequency
+                              << " samples=" << snapshot.validSamples << " model=" << snapshot.clock.version
+                              << " primary=" << utf8(snapshot.primarySource)
+                              << " error_ms=" << snapshot.clock.errorMs
+                              << " rate_ppm=" << snapshot.clock.frequencyPpm
+                              << " mature=" << snapshot.frequencyMature << std::endl;
+                }
+            }
+            engine.shutdown();
+        }
+        WSACleanup();
+        return 0;
+    }
     if (argc > 1 && std::string(argv[1]) == "--survey") {
         std::ofstream out("build/source-survey.json");
         out << "[";
         bool first = true;
-        for (const auto& source : regionalSources()) {
-            auto r = queryNtp(source, 0, initialClock(), [] { return false; });
+        std::set<std::wstring> queried;
+        for (const auto& source : defaultSources()) {
+            auto r = queryNtp(
+                source, 0, initialClock(), [] { return false; }, L"", L"",
+                [&](const std::wstring& address) {
+                    return queried.insert(address + L":" + std::to_wstring(source.port)).second;
+                });
             if (!first)
                 out << ",";
             first = false;
             out << "{\"host\":\"" << utf8(source.host) << "\",\"valid\":" << (r.ok ? "true" : "false")
                 << ",\"rtt_ms\":" << r.sample.rttMs << ",\"offset_ms\":" << r.sample.offsetMs
-                << ",\"stratum\":" << r.sample.stratum << "}";
+                << ",\"stratum\":" << r.sample.stratum
+                << ",\"shared_endpoint_skipped\":" << (r.deferred ? "true" : "false") << "}";
             std::cout << utf8(source.host) << " valid=" << r.ok << " rtt=" << r.sample.rttMs << " ms\n";
         }
         out << "]";
@@ -139,6 +175,7 @@ int main(int argc, char** argv) {
         WSACleanup();
         return 0;
     }
+    runEstimatorTests();
     check(parseTime(L"59:59.123")->millisecond == 123, "three-digit millisecond input");
     check(!parseTime(L"23:59:59.999"), "hour input rejected");
     check(normalizeTimeFields(L"5", L"", L"1") == L"05:00.100",
@@ -257,6 +294,9 @@ int main(int argc, char** argv) {
         Source local{L"127.0.0.1", L"local", server.port, 4};
         auto r = queryNtp(local, 0, initialClock(), [] { return false; });
         check(r.ok && std::abs(r.sample.offsetMs - 12) < 3, "real UDP localhost query");
+        check(r.sent && r.receivedQpc > r.sentQpc &&
+                  r.sample.qpc == r.sentQpc + (r.receivedQpc - r.sentQpc) / 2,
+              "UDP phase observation uses exchange midpoint QPC");
         Config c;
         c.autoSync = false;
         c.autoSystemClock = true;
@@ -274,15 +314,18 @@ int main(int argc, char** argv) {
         check(s.clock.calibrated, "engine applies network estimate");
         check(clockWrites == 1, "automatic system clock writer invoked outside freeze (mock only)");
         Job j;
+        j.onlyWindow = reinterpret_cast<HWND>(static_cast<INT_PTR>(-1));
         j.target = s.clock.utc(qpc(), qpcFrequency()) + 60 * Second + 150 * Millisecond;
         j.input = *keyPlan(L"F8");
         check(e.arm(j, message), "arm before cutoff");
+        check(e.snapshot().phase == SyncPhase::Refining, "task enters refinement before freeze");
         check(e.withdrawForEdit(), "pending schedule editable before freeze");
         check(!e.snapshot().active, "editing withdraws pending task");
         check(e.arm(j, message), "rearm edited schedule");
         Sleep(350);
         s = e.snapshot();
         check(s.frozen && !s.syncing, "automatic 60 second freeze");
+        check(s.phase == SyncPhase::Frozen, "refinement ends at freeze boundary");
         check(s.preparationSerial == 1 && !s.actionSummary.empty(),
               "one preparation notification with action description");
         check(!e.withdrawForEdit(), "preparing schedule cannot be silently changed");
@@ -322,6 +365,7 @@ int main(int argc, char** argv) {
             Sleep(5);
         Job j;
         j.probe = true;
+        j.onlyWindow = reinterpret_cast<HWND>(static_cast<INT_PTR>(-1));
         j.input = *keyPlan(L"F8");
         j.target = e.snapshot().clock.utc(qpc(), qpcFrequency()) + 60 * Second + 50 * Millisecond;
         check(e.arm(j, message), "arm with pending query");
@@ -331,6 +375,59 @@ int main(int argc, char** argv) {
               "late response cannot calibrate after freeze");
         check(lateWrites == 0, "late response cannot write system clock");
         e.cancel();
+    }
+    {
+        MockNtp server;
+        Config config;
+        config.sources = {{L"127.0.0.1", L"one", server.port, 4}, {L"localhost", L"two", server.port, 4}};
+        Engine engine(config, L"build/refinement-test");
+        for (int i = 0; i < 100 && !engine.snapshot().clock.calibrated; ++i)
+            Sleep(20);
+        Sleep(150);
+        auto initial = engine.snapshot();
+        check(server.requests == 1 && initial.availableGroups == 1,
+              "shared endpoint is queried and counted only once");
+        check(initial.sources[0].failures == 0 && initial.sources[1].failures == 0,
+              "deferred duplicate does not count as a source failure");
+        Job job;
+        job.onlyWindow = reinterpret_cast<HWND>(static_cast<INT_PTR>(-1));
+        job.input = *keyPlan(L"F8");
+        job.target = initial.clock.utc(qpc(), qpcFrequency()) + 100 * Second;
+        std::wstring message;
+        check(engine.arm(job, message), "arm safe refinement integration test");
+        for (int i = 0; i < 260 && engine.snapshot().refinementSamples == 0; ++i)
+            Sleep(20);
+        auto refining = engine.snapshot();
+        check(refining.phase == SyncPhase::Refining && refining.refinementSamples > 0 &&
+                  refining.clock.version > initial.clock.version,
+              "refinement receives new samples and commits a model");
+        check(refining.refinementProgress > 0 && refining.refinementProgress < 1,
+              "refinement reports time-window progress");
+        engine.stopSync();
+        const auto pausedVersion = engine.snapshot().clock.version;
+        Sleep(150);
+        check(engine.snapshot().phase == SyncPhase::Paused &&
+                  engine.snapshot().clock.version == pausedVersion,
+              "manual pause stops refinement model updates");
+        check(engine.startSync(message), "resume refinement manually");
+        engine.setRefinement(false);
+        check(engine.snapshot().phase == SyncPhase::Tracking,
+              "refinement checkbox can leave refinement phase");
+        engine.setRefinement(true);
+        check(engine.snapshot().phase == SyncPhase::Refining,
+              "refinement checkbox can restore refinement phase");
+        engine.cancel();
+        for (int i = 0; i < 100 && engine.snapshot().active; ++i)
+            Sleep(10);
+        check(engine.snapshot().records.empty(), "refinement verification sends no input");
+        check(engine.configure(config, message) && !engine.snapshot().frequencyMature &&
+                  engine.snapshot().refinementSamples == 0 && !engine.snapshot().clock.calibrated,
+              "configuration reload clears estimator maturity and phase history");
+        engine.sessionInterrupted();
+        auto interrupted = engine.snapshot();
+        check(!interrupted.clock.calibrated && interrupted.lastSuccessfulSyncQpc == 0 &&
+                  interrupted.clock.frequencyPpm == 0 && !interrupted.frequencyMature,
+              "power or session interruption invalidates learned clock history");
     }
     std::filesystem::create_directories(L"build/config-test");
     Config c;
@@ -342,6 +439,10 @@ int main(int argc, char** argv) {
     c.actionKind = 0;
     c.key = L"CTRL+F8";
     c.autoElevate = true;
+    c.preRefine = false;
+    c.faultBudget = 2;
+    c.refinementLeadSeconds = 240;
+    c.refinementPollSeconds = 16;
     check(saveConfig(L"build/config-test/Ctimer.ini", c, error), "atomic config write");
     Config loaded;
     check(loadConfig(L"build/config-test/Ctimer.ini", loaded, error) && loaded.sources[0].minPollSeconds == 4,
@@ -351,6 +452,9 @@ int main(int argc, char** argv) {
           "appointment time persists across reload");
     check(loaded.actionKind == 0 && loaded.key == L"CTRL+F8" && loaded.autoElevate,
           "action and elevation preferences persist");
+    check(!loaded.preRefine && loaded.faultBudget == 2 && loaded.refinementLeadSeconds == 240 &&
+              loaded.refinementPollSeconds == 16,
+          "estimator and refinement options persist");
     {
         Config layout = c;
         layout.window = {true, true, false, false, -1500, 80, 450, 282, 96};

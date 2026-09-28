@@ -25,7 +25,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Resource compilation failed' }
     $common = @('-std=c++20','-O2','-DNDEBUG','-DUNICODE','-D_UNICODE','-DWIN32_LEAN_AND_MEAN','-DNOMINMAX','-D_WIN32_WINNT=0x0A00','-Wall','-Wextra','-Isrc','-Ibuild/generated','-Iresources')
     $objects = @()
-    foreach ($unit in @('core','platform','ntp','engine')) {
+    foreach ($unit in @('core','estimator','platform','ntp','engine')) {
         $objectFile = "build/$unit.o"
         & $compiler @common -c "src/$unit.cpp" -o $objectFile
         if ($LASTEXITCODE -ne 0) { throw "Compilation failed: $unit" }
@@ -38,7 +38,7 @@ try {
     $builtVersion = (Get-Item -LiteralPath (Join-Path $distributionDirectory $ExecutableName)).VersionInfo
     $expectedName = -join ([char[]]@(0x5b9a,0x65f6,0x70b9,0x51fb,0x5668))
     if ($builtVersion.FileDescription -ne $expectedName -or $builtVersion.ProductVersion -ne $version) { throw 'Application name or version resource verification failed' }
-    & $compiler @common -static tests/tests.cpp @objects -o build/CtimerTests.exe -lws2_32 -luser32 -lshell32 -ladvapi32
+    & $compiler @common -static tests/tests.cpp tests/estimator_tests.cpp @objects -o build/CtimerTests.exe -lws2_32 -luser32 -lshell32 -ladvapi32
     if ($LASTEXITCODE -ne 0) { throw 'Test compilation failed' }
     if (-not (Test-Path -LiteralPath 'dist/Ctimer.ini')) { Copy-Item -LiteralPath 'config/Ctimer.ini' -Destination 'dist/Ctimer.ini' }
     if (-not $SkipTests) {

@@ -1,5 +1,6 @@
 #pragma once
 #include "ntp.hpp"
+#include "estimator.hpp"
 #include <atomic>
 #include <deque>
 #include <map>
@@ -11,9 +12,11 @@ struct SourceView {
     Source source;
     std::wstring status{L"等待采样"}, address;
     std::optional<Sample> last;
-    std::deque<Sample> history;
     unsigned received{};
     unsigned failures{};
+    unsigned consecutiveFailures{}, filteredSamples{};
+    double basisAgeSeconds{};
+    FrequencyFit fit;
     double qualityMs{};
     bool selected{}, disabled{};
 };
@@ -41,6 +44,13 @@ struct Snapshot {
     unsigned completedCycles{};
     Tick lastSuccessfulSyncQpc{}, lastAttemptQpc{};
     bool lastSyncFailed{};
+    SyncPhase phase{SyncPhase::Discovering};
+    Tick refinementStarted{};
+    unsigned refinementSamples{};
+    double refinementProgress{};
+    int frequencyGroups{}, toleratedFaults{}, requestedFaults{1};
+    bool faultToleranceReady{}, frequencyMature{};
+    Interval safeInterval;
     int consensusGroups{};
     int groups{}, availableGroups{};
     unsigned attempts{}, validSamples{}, discardedAfterStop{};
@@ -58,6 +68,7 @@ class Engine {
     void stopSync();
     bool configure(const Config& config, std::wstring& error);
     void setSystemClockSync(bool enabled);
+    void setRefinement(bool enabled);
     bool arm(const Job& job, std::wstring& error);
     bool withdrawForEdit();
     void cancel();
@@ -80,8 +91,11 @@ class Engine {
     std::function<SystemClockResult(const ClockModel&)> clockSetter_;
     Tick lastSystemWrite_{};
     std::map<std::wstring, Tick> nextQuery_;
-    std::vector<PhasePoint> phaseHistory_;
-    std::vector<std::size_t> lastSelection_;
+    std::map<std::wstring, Tick> nextEndpointQuery_;
+    std::map<std::wstring, PathTracker> paths_;
+    std::string sessionId_;
+    std::uint64_t sampleSequence_{};
+    bool acquireEndpoint(const std::wstring& address, const Source& source, std::uint64_t epoch);
     void freezeLocked(Tick now);
     void maybeFreezeLocked(Tick now);
     void resumeAfterJobLocked();
@@ -90,6 +104,7 @@ class Engine {
     void schedulerLoop();
     void updateEstimateLocked(Tick now, Tick freshSince);
     void logSamples(const std::vector<std::pair<Source, NtpResult>>& results);
+    void logModel(const Snapshot& snapshot);
     void logExecution(const Job& job, const ClockModel& model, const std::vector<ExecutionRecord>& records,
                       const std::wstring& status);
 };

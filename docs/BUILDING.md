@@ -56,6 +56,15 @@ python ./scripts/verify-auto-ui.py --executable ./dist/Ctimer.exe
 
 等待延迟基准使用 `build/CtimerTests.exe --benchmark`，它不代表真实 UTC 或目标应用响应精度。
 
+v0.6 添加了 2,000 个随机单故障覆盖案例、路径回归、精校准与端点去重验证。可使用以下命令在当前网络采样六分钟，并分析诊断日志（不会创建点击预约或写系统时间）：
+
+```powershell
+./build/CtimerTests.exe --observe 360
+python ./scripts/analyze-ntp-log.py ./build/ntp-observation-实际输出编号
+```
+
+`--survey` 只做一轮公开源查询，不能用来证明长期精度。观测中的 `CtimerTests.exe` 需运行结束后再构建，以免 Windows 锁住测试可执行文件。测试输出的 JSON 和 CSV 默认保留在 build 中，不进入公开仓库。
+
 ## 仓库与 Release
 
 - 源码、资源、文档、配置模板和构建脚本进入 Git。

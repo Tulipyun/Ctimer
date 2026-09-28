@@ -37,6 +37,9 @@ struct Config {
     int holdMs{20}, intervalMs{100}, repetitions{1}, utcOffsetMinutes{480};
     int lateToleranceMs{10};
     double driftAllowancePpm{30};
+    int faultBudget{1};
+    bool preRefine{true};
+    int refinementLeadSeconds{180}, refinementPollSeconds{10};
 };
 bool loadConfig(const std::filesystem::path& path, Config& config, std::wstring& error);
 bool saveConfig(const std::filesystem::path& path, const Config& config, std::wstring& error);

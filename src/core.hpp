@@ -53,13 +53,28 @@ struct Source {
     int minPollSeconds{10};
     bool enabled{true};
 };
+enum class SyncPhase { Discovering, Tracking, Refining, Frozen, Paused };
+SyncPhase syncPhase(bool syncing, bool frozen, bool active, bool refiningEnabled, Ns now, Ns target,
+                    int refinementLeadSeconds);
 std::vector<Source> defaultSources();
 std::vector<Source> regionalSources();
+std::vector<Source> diverseSources();
 std::wstring operatorGroup(const Source& source);
 bool addRegionalSources(std::vector<Source>& sources);
+bool addDiverseSources(std::vector<Source>& sources);
 std::wstring serializeSources(const std::vector<Source>& sources);
 std::optional<std::vector<Source>> parseSources(const std::wstring& text, std::wstring& error);
 
+struct Interval {
+    double lower{}, upper{};
+};
+struct IntervalConsensus {
+    bool valid{}, ambiguous{}, faultToleranceReady{};
+    int requestedFaults{}, toleratedFaults{}, quorum{};
+    Interval envelope;
+    std::vector<Interval> regions;
+};
+IntervalConsensus selectIntervals(const std::vector<Interval>& intervals, int requestedFaults);
 struct Sample {
     std::size_t source{};
     std::wstring group;
@@ -67,7 +82,10 @@ struct Sample {
     double offsetMs{}, rttMs{}, rootDistanceMs{};
     int stratum{};
     double jitterMs{}, failurePenaltyMs{};
+    std::optional<Interval> interval{};
 };
+Interval sampleInterval(const Sample& sample);
+double sampleQuality(const Sample& sample);
 struct Estimate {
     bool valid{};
     double offsetMs{}, uncertaintyMs{}, jitterMs{};
@@ -75,8 +93,11 @@ struct Estimate {
     int consensusGroups{};
     std::size_t referenceSource{};
     std::vector<std::size_t> usedSources;
+    Interval safeInterval;
+    bool faultToleranceReady{}, ambiguous{};
+    int toleratedFaults{}, quorum{};
 };
-Estimate combineSources(const std::vector<Sample>& samples);
+Estimate combineSources(const std::vector<Sample>& samples, int requestedFaults = 1);
 double median(std::vector<double> v);
 struct PhasePoint {
     double seconds{}, offsetMs{};
