@@ -1,0 +1,30 @@
+#pragma code_page(65001)
+#include <windows.h>
+#include "version.h"
+#include "product.h"
+1 RT_MANIFEST "app.manifest"
+100 ICON "app.ico"
+101 WAVE "prepare.wav"
+1 VERSIONINFO
+FILEVERSION CTIMER_VERSION_NUMERIC
+PRODUCTVERSION CTIMER_VERSION_NUMERIC
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904B0"
+  BEGIN
+   VALUE "FileDescription", CTIMER_CHINESE_NAME
+   VALUE "FileVersion", CTIMER_VERSION_STRING "\0"
+   VALUE "ProductName", CTIMER_PRODUCT_NAME
+   VALUE "ProductVersion", CTIMER_VERSION_STRING "\0"
+   VALUE "InternalName", "Ctimer\0"
+   VALUE "OriginalFilename", "Ctimer.exe\0"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x0409, 1200
+ END
+END
