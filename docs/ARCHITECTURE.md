@@ -22,8 +22,10 @@ flowchart LR
 | `src/ntp.*` | 可取消 DNS、UDP、NTP 四时间戳与协议验证 |
 | `src/engine.*` | 同步/冻结/执行状态机、后台线程、误差预算、日志 |
 | `src/main.cpp` | Win32 GUI、数值输入、预约持久化、权限提示与窗口生命周期 |
+| `src/clock_view.*` | 主时钟双缓冲、分段字体、局部重绘及 100 ms 显示采样，与校时/输入调度隔离 |
 | `tests/tests.cpp` | 算法、协议、状态和 Windows 资源测试 |
 | `tests/estimator_tests.cpp` | 随机故障覆盖、路径漂移与精校准边界测试 |
+| `tests/clock_view_tests.cpp` | 不激活的离屏窗口：GDI 像素、局部失效区域、缩放及资源复用验证 |
 
 ## 时间与输入的边界
 

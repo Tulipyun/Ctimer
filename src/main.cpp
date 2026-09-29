@@ -1,5 +1,6 @@
 #include "engine.hpp"
 #include "app_info.hpp"
+#include "clock_view.hpp"
 #include <commctrl.h>
 #include <shellapi.h>
 #include <wtsapi32.h>
@@ -55,7 +56,7 @@ enum Id {
 };
 HINSTANCE instance;
 HWND mainWindow{}, sourceWindow{};
-HFONT normalFont{}, titleFont{}, clockFont{}, miniClockFont{}, errorFont{}, monoFont{}, bannerFont{};
+HFONT normalFont{}, titleFont{}, errorFont{}, monoFont{}, bannerFont{};
 HBRUSH backgroundBrush{}, readyBrush{}, scheduledBrush{};
 HICON largeAppIcon{}, smallAppIcon{};
 UINT dpi = 96;
@@ -133,7 +134,7 @@ void persistWindowPosition() {
         formNote = L"窗口位置保存失败：" + error;
 }
 void fonts() {
-    for (auto f : {normalFont, titleFont, clockFont, miniClockFont, errorFont, monoFont, bannerFont})
+    for (auto f : {normalFont, titleFont, errorFont, monoFont, bannerFont})
         if (f)
             DeleteObject(f);
     normalFont =
@@ -142,12 +143,6 @@ void fonts() {
     titleFont =
         CreateFontW(-px(25), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-    clockFont =
-        CreateFontW(-px(48), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                    CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Consolas");
-    miniClockFont =
-        CreateFontW(-px(36), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                    CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Consolas");
     errorFont =
         CreateFontW(-px(19), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Consolas");
@@ -217,17 +212,16 @@ void layout() {
     place(301, 183, 22, 112, 20);
     place(Topmost, w - 216, 16, 90, 26);
     place(MiniMode, w - 115, 12, 100, 30);
-    SendMessageW(control(ClockLabel), WM_SETFONT, reinterpret_cast<WPARAM>(mini ? miniClockFont : clockFont),
-                 FALSE);
+    styleClockView(control(ClockLabel), dpi, mini);
     if (mini) {
-        place(ClockLabel, 16, 58, 264, 45);
+        place(ClockLabel, 16, 52, 264, 62);
         place(SignedOffset, 287, 61, w - 303, 27);
         place(Quality, 287, 89, w - 303, 21);
         place(TaskStatus, 16, 122, w - 32, 36);
         place(ActionStatus, 16, 158, w - 32, 28);
         place(Cancel, 16, 199, 116, 30);
     } else {
-        place(ClockLabel, 16, 55, 366, 58);
+        place(ClockLabel, 16, 51, 366, 76);
         place(SignedOffset, 394, 62, w - 410, 29);
         place(Quality, 394, 94, w - 410, 22);
         place(TaskStatus, 16, 130, w - 32, 35);
@@ -767,8 +761,7 @@ void createControls() {
     SendMessageW(control(AutoSystemClock), BM_SETCHECK, config.autoSystemClock ? BST_CHECKED : BST_UNCHECKED,
                  0);
     add(mainWindow, L"BUTTON", L"管理员运行", WS_TABSTOP, Elevate);
-    add(mainWindow, L"STATIC", L"00:00:00.000", 0, ClockLabel);
-    SendMessageW(control(ClockLabel), WM_SETFONT, reinterpret_cast<WPARAM>(clockFont), TRUE);
+    add(mainWindow, ClockViewClass, L"00:00:00.000", 0, ClockLabel);
     int minutes = config.utcOffsetMinutes;
     std::wstring zone = L"UTC" + std::wstring(minutes >= 0 ? L"+" : L"−") +
                         std::to_wstring(std::abs(minutes) / 60) + L":" +
@@ -972,7 +965,6 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 return TRUE;
             },
             0);
-        SendMessageW(control(ClockLabel), WM_SETFONT, reinterpret_cast<WPARAM>(clockFont), TRUE);
         SendMessageW(control(300), WM_SETFONT, reinterpret_cast<WPARAM>(titleFont), TRUE);
         SendMessageW(control(TaskStatus), WM_SETFONT, reinterpret_cast<WPARAM>(bannerFont), TRUE);
         SendMessageW(control(SignedOffset), WM_SETFONT, reinterpret_cast<WPARAM>(errorFont), TRUE);
@@ -984,8 +976,8 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     }
     case WM_TIMER:
         if (wp == 1)
-            setText(ClockLabel,
-                    formatTime(cached.clock.utc(qpc(), qpcFrequency()), false, config.utcOffsetMinutes));
+            updateClockView(control(ClockLabel), cached.clock.utc(qpc(), qpcFrequency()),
+                            config.utcOffsetMinutes);
         else {
             refresh();
             if (saveSettingsAfter && qpc() >= saveSettingsAfter) {
@@ -1221,7 +1213,7 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return reinterpret_cast<LRESULT>(ready ? readyBrush : scheduledBrush);
         }
         SetBkColor(dc, RGB(248, 250, 252));
-        SetTextColor(dc, label == control(ClockLabel) ? RGB(13, 100, 115) : RGB(40, 53, 67));
+        SetTextColor(dc, RGB(40, 53, 67));
         return reinterpret_cast<LRESULT>(backgroundBrush);
     }
     case WM_EXITSIZEMOVE:
@@ -1368,6 +1360,8 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int show) {
         return 3;
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&controls);
+    if (!registerClockView(h))
+        return 4;
     backgroundBrush = CreateSolidBrush(RGB(248, 250, 252));
     readyBrush = CreateSolidBrush(RGB(255, 236, 194));
     scheduledBrush = CreateSolidBrush(RGB(231, 242, 249));
@@ -1449,7 +1443,7 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int show) {
     DeleteObject(scheduledBrush);
     if (instanceMutex)
         CloseHandle(instanceMutex);
-    for (auto f : {normalFont, titleFont, clockFont, miniClockFont, errorFont, monoFont, bannerFont})
+    for (auto f : {normalFont, titleFont, errorFont, monoFont, bannerFont})
         if (f)
             DeleteObject(f);
     if (largeAppIcon)

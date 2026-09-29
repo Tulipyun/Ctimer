@@ -33,12 +33,14 @@ try {
     }
     & $compiler @common -c src/main.cpp -o build/main.o
     if ($LASTEXITCODE -ne 0) { throw 'GUI compilation failed' }
-    & $compiler -static -municode -mwindows @objects build/main.o build/app-res.o -o "dist/$ExecutableName" -lws2_32 -luser32 -lshell32 -lcomctl32 -lgdi32 -lwtsapi32 -lwinmm -ladvapi32
+    & $compiler @common -c src/clock_view.cpp -o build/clock_view.o
+    if ($LASTEXITCODE -ne 0) { throw 'Clock view compilation failed' }
+    & $compiler -static -municode -mwindows @objects build/main.o build/clock_view.o build/app-res.o -o "dist/$ExecutableName" -lws2_32 -luser32 -lshell32 -lcomctl32 -lgdi32 -lwtsapi32 -lwinmm -ladvapi32
     if ($LASTEXITCODE -ne 0) { throw 'GUI link failed' }
     $builtVersion = (Get-Item -LiteralPath (Join-Path $distributionDirectory $ExecutableName)).VersionInfo
     $expectedName = -join ([char[]]@(0x5b9a,0x65f6,0x70b9,0x51fb,0x5668))
     if ($builtVersion.FileDescription -ne $expectedName -or $builtVersion.ProductVersion -ne $version) { throw 'Application name or version resource verification failed' }
-    & $compiler @common -static tests/tests.cpp tests/estimator_tests.cpp @objects -o build/CtimerTests.exe -lws2_32 -luser32 -lshell32 -ladvapi32
+    & $compiler @common -static tests/tests.cpp tests/estimator_tests.cpp tests/clock_view_tests.cpp @objects build/clock_view.o -o build/CtimerTests.exe -lws2_32 -luser32 -lshell32 -ladvapi32 -lgdi32
     if ($LASTEXITCODE -ne 0) { throw 'Test compilation failed' }
     if (-not (Test-Path -LiteralPath 'dist/Ctimer.ini')) { Copy-Item -LiteralPath 'config/Ctimer.ini' -Destination 'dist/Ctimer.ini' }
     if (-not $SkipTests) {

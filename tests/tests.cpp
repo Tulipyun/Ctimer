@@ -12,6 +12,7 @@
 using namespace ct;
 static int failures{}, checks{};
 void runEstimatorTests();
+void runClockViewTests();
 void check(bool condition, const char* label) {
     ++checks;
     if (!condition) {
@@ -176,6 +177,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     runEstimatorTests();
+    runClockViewTests();
     check(parseTime(L"59:59.123")->millisecond == 123, "three-digit millisecond input");
     check(!parseTime(L"23:59:59.999"), "hour input rejected");
     check(normalizeTimeFields(L"5", L"", L"1") == L"05:00.100",

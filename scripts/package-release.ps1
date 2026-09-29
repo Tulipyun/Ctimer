@@ -18,6 +18,7 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'config\Ctimer.ini') -Destination
 Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'),(Join-Path $projectRoot 'CHANGELOG.md'),(Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md') -Destination $stagingDirectory
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\USAGE.md'),(Join-Path $projectRoot 'docs\BUILDING.md') -Destination (Join-Path $stagingDirectory 'docs')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\v0.6-同步升级与测试.md') -Destination (Join-Path $stagingDirectory 'docs')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\v0.6.1-时钟显示优化.md') -Destination (Join-Path $stagingDirectory 'docs')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'licenses') -Destination $stagingDirectory -Recurse
 $releaseBinary = Join-Path $outputDirectory "Ctimer-v$version.exe"
 if (-not [string]::Equals($binary.FullName, $releaseBinary, [StringComparison]::OrdinalIgnoreCase)) { Copy-Item -LiteralPath $binary.FullName -Destination $releaseBinary -Force }
